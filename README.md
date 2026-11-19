@@ -1,141 +1,62 @@
-# CtYun 云电脑保活
+# CtYun 云电脑保活（Teleagent 版）
 
-CtYun 用于登录天翼云电脑并维持 WebSocket 保活连接。当前版本支持：
+基于 [leleji/CtYun](https://github.com/leleji/CtYun) 二次开发，**只支持中国电信 Teleagent（agent.teleai.com.cn）的云电脑保活**。原版天翼云电脑账号密码登录（验证码 OCR、短信绑定等）已全部移除。
 
-- 多账号同时登录和保活。
-- Windows/本机可执行文件：支持本地配置文件模式和交互输入模式。
-- Docker：支持挂载本地配置文件模式和 `-it` 交互输入模式。
-- 首次绑定设备需要短信验证码时，通过终端交互输入。
+## 原理
 
-## 配置文件模式
+Teleagent 与天翼云电脑共用同一套 desk 后端与 CLINK 协议，保活链路为：
 
-程序默认在数据目录读取 `accounts.json`：
+1. 用 `operationToken`（Teleagent 会话 Cookie）调 `instance/list` 找到云电脑实例，调 `instance/connect` 换取一次性 `connectToken`。
+2. 与 `desk.ctyun.cn:8810` 做 RSA 协商加密（negotiationEncKey + AES-CBC），用 `connectToken` 调 `getConnectDataByToken` 换取桌面连接信息。
+3. 连接 `wss://<网关>/clinkProxy/<桌面ID>/MAIN`，按原版协议完成 REDQ 校验应答与 SendInfo 应答；每 `keepAliveSeconds` 秒强制断开重连，并重新换取连接信息（connectToken 一次性）。
 
-- 本机可执行文件：默认数据目录为程序所在目录。
+## 配置
+
+程序在数据目录读取 `config.json`：
+
+- 本机运行：默认数据目录为程序所在目录。
 - Docker：默认数据目录为 `/app/data`，建议挂载到宿主机。
-- 也可以通过环境变量 `CTYUN_CONFIG` 指定配置文件路径。
-- 也可以通过环境变量 `CTYUN_DATA_DIR` 指定数据目录。
+- 环境变量 `CTYUN_DATA_DIR` 可指定数据目录，`TELEAGENT_CONFIG` 可指定配置文件完整路径。
 
-`accounts.json` 示例：
+`config.json` 示例：
 
 ```json
 {
-  "keepAliveSeconds": 60,
-  "accounts": [
-    {
-      "name": "account-a",
-      "user": "你的账号1",
-      "password": "你的密码1",
-      "deviceCode": "web_自行生成的32位随机字符"
-    },
-    {
-      "name": "account-b",
-      "user": "你的账号2",
-      "password": "你的密码2"
-    }
-  ]
+  "operationToken": "从浏览器 Cookie 复制的 operationToken 值",
+  "instanceId": "",
+  "keepAliveSeconds": 60
 }
 ```
 
-`deviceCode` 可不填。程序会为每个账号自动生成设备码，并保存到 `devices/{账号名}.txt`。为了避免每次 Docker 重建镜像后重新绑定设备，务必持久化数据目录。
+- `operationToken`：**必填**。获取方式：浏览器登录 https://agent.teleai.com.cn/teleagent 后，打开开发者工具 → 应用/存储 → Cookie，复制 `operationToken` 的值。
+- `instanceId`：可选。为空时自动选择实例列表中的第一个；账号下有多台云电脑时建议填 `instance/list` 返回的实例 `id`。
+- `keepAliveSeconds`：可选，默认 60，最小 10。
 
-Linux 生成设备码示例：
+也可以用环境变量覆盖：`TELEAGENT_OPERATION_TOKEN`、`TELEAGENT_INSTANCE_ID`、`TELEAGENT_KEEP_ALIVE_SECONDS`。未配置令牌时，程序会在控制台提示输入。
 
-```bash
-echo "web_$(cat /dev/urandom | tr -dc 'a-zA-Z0-9' | fold -w 32 | head -n 1)"
-```
+### 有效期说明
 
-## 本机运行
+`operationToken` 约 29 天过期，且服务端没有刷新接口。过期后程序会明确报错退出，重新登录 Teleagent 并更新 `config.json` 中的 `operationToken` 即可（需要过一次登录滑块验证）。
 
-把 `accounts.json` 放到程序目录后直接运行：
-
-```bash
-CtYun.exe
-```
-
-如果没有配置文件，也没有环境变量，程序会进入交互输入模式：
-
-```text
-账号:
-密码:
-继续添加账号? (y/N):
-```
-
-首次设备绑定时，程序会提示输入短信验证码。
-
-## Docker 首次运行
-
-准备宿主机配置目录：
+## 运行
 
 ```bash
-mkdir -p ./ctyun-data
+dotnet run --project CtYun
 ```
 
-把 `accounts.json` 放到 `./ctyun-data/accounts.json`。首次运行建议使用 `-it`，方便输入短信验证码：
+或使用仓库自带 Dockerfile 构建镜像，挂载数据目录后运行：
 
 ```bash
-docker run -it --rm \
-  --name ctyun-init \
-  -v "$(pwd)/ctyun-data:/app/data" \
-  su3817807/ctyun:latest
+docker build -t ctyun-teleagent ./CtYun
+docker run -d --name ctyun-teleagent -v /your/data:/app/data ctyun-teleagent
 ```
 
-看到保活任务启动后，说明设备码已经绑定成功。之后可以按 `Ctrl+C` 停止初始化容器，再改为后台运行。
-
-## Docker 后台运行
-
-设备绑定完成后使用：
+自检（无需令牌，只验证 desk 协商加密链是否可用）：
 
 ```bash
-docker run -d \
-  --name ctyun \
-  -v "$(pwd)/ctyun-data:/app/data" \
-  su3817807/ctyun:latest
+dotnet CtYun.dll --selftest
 ```
 
-查看日志：
+## 致谢
 
-```bash
-docker logs -f ctyun
-```
-
-## 兼容旧环境变量模式
-
-单账号仍支持旧环境变量。首次绑定设备时同样使用 `-it` 输入短信验证码：
-
-```bash
-docker run -it --rm \
-  --name ctyun-init \
-  -v "$(pwd)/ctyun-data:/app/data" \
-  -e APP_USER="你的账号" \
-  -e APP_PASSWORD="你的密码" \
-  -e DEVICECODE="web_你的设备码" \
-  su3817807/ctyun:latest
-```
-
-绑定完成后改为后台运行：
-
-```bash
-docker run -d \
-  --name ctyun \
-  -v "$(pwd)/ctyun-data:/app/data" \
-  -e APP_USER="你的账号" \
-  -e APP_PASSWORD="你的密码" \
-  -e DEVICECODE="web_你的设备码" \
-  su3817807/ctyun:latest
-```
-
-建议新部署优先使用 `accounts.json`，多账号管理更清晰，也更适合 Docker 持久化。
-
-## 日志与保活
-
-程序会为每个账号、每台云电脑启动独立保活任务。日志格式会带上账号名和云电脑编号，便于区分：
-
-```text
-[account-a][desktop-code] -> 收到保活校验
-[account-a][desktop-code] -> 发送保活响应成功
-```
-
-## 说明
-
-登录图形验证码识别接口方案来自 [sml2h3/ddddocr](https://github.com/sml2h3/ddddocr)。
+原项目 [leleji/CtYun](https://github.com/leleji/CtYun)（CLINK 协议保活核心、REDQ 校验应答实现均来自原版）。
