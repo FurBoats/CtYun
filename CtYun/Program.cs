@@ -9,13 +9,41 @@ using System.Text.Json;
 using var globalCts = new CancellationTokenSource();
 
 Utility.WriteLine(ConsoleColor.Green, $"版本：v {Assembly.GetEntryAssembly()?.GetName().Version}");
+Utility.WriteLine(ConsoleColor.Green, "Teleagent 云电脑保活（仅 operationToken 登录）");
 
-var runtimeConfig = LoadRuntimeConfig();
-if (runtimeConfig.Accounts.Count == 0)
+if (args.Contains("--selftest"))
 {
-    Utility.WriteLine(ConsoleColor.Red, "未读取到账号配置。请配置 accounts.json，或设置 APP_USER/APP_PASSWORD，或使用交互输入模式。");
+    // 无令牌冒烟：只验证 desk 协商加密链（getServData → negotiationEncKey → AES 往返）。
+    var deskTest = new DeskApi("web_" + GenerateRandomString(32));
+    try
+    {
+        await deskTest.EnsureNegotiatedAsync();
+        Utility.WriteLine(ConsoleColor.Green, "[selftest] 密钥协商成功。");
+        try
+        {
+            var info = await deskTest.GetConnectDataByTokenAsync("selftest-bogus-token", "0");
+            Utility.WriteLine(ConsoleColor.Yellow, "[selftest] 假 token 竟然换到了连接信息？desktopId=" + info.DesktopId);
+        }
+        catch (Exception ex)
+        {
+            Utility.WriteLine(ConsoleColor.Green, "[selftest] 假 token 被拒（符合预期）：" + ex.Message);
+        }
+    }
+    catch (Exception ex)
+    {
+        Utility.WriteLine(ConsoleColor.Red, "[selftest] 密钥协商失败：" + ex.Message);
+    }
     return;
 }
+
+var config = LoadConfig();
+if (config == null || string.IsNullOrWhiteSpace(config.OperationToken))
+{
+    Utility.WriteLine(ConsoleColor.Red, "未读取到 operationToken。请在 config.json 中配置，或设置环境变量 TELEAGENT_OPERATION_TOKEN。");
+    Utility.WriteLine(ConsoleColor.Yellow, "获取方式：浏览器登录 agent.teleai.com.cn 后，在 Cookie 中复制 operationToken 的值（约 29 天有效）。");
+    return;
+}
+var keepAliveSeconds = Math.Max(10, config.KeepAliveSeconds);
 
 Console.CancelKeyPress += (s, e) =>
 {
@@ -23,114 +51,47 @@ Console.CancelKeyPress += (s, e) =>
     globalCts.Cancel();
 };
 
-var sessionTasks = runtimeConfig.Accounts.Select(account => RunAccountAsync(account, runtimeConfig, globalCts.Token));
+var teleagent = new TeleagentApi(config.OperationToken.Trim());
+var desk = new DeskApi(ResolveDeviceCode());
 
+List<InstanceInfo> instances;
 try
 {
-    await Task.WhenAll(sessionTasks);
+    instances = await teleagent.GetInstancesAsync(globalCts.Token);
+}
+catch (TeleagentAuthException ex)
+{
+    Utility.WriteLine(ConsoleColor.Red, ex.Message);
+    Utility.WriteLine(ConsoleColor.Red, "operationToken 已失效，请重新登录 Teleagent 后更新配置。");
+    return;
+}
+
+if (instances.Count == 0)
+{
+    Utility.WriteLine(ConsoleColor.Yellow, "未获取到云电脑实例。");
+    return;
+}
+
+var instance = instances.FirstOrDefault(i => string.Equals(i.Id, config.InstanceId, StringComparison.OrdinalIgnoreCase)) ?? instances[0];
+Utility.WriteLine(ConsoleColor.Cyan, $"目标实例：{instance.Id}（uid={instance.Uid}，status={instance.Status}）");
+if (instance.Status != 100)
+{
+    Utility.WriteLine(ConsoleColor.Yellow, $"实例状态不是运行中（status={instance.Status}），仍尝试连接；若失败请先在 Teleagent 界面确认云电脑已开机。");
+}
+
+Utility.WriteLine(ConsoleColor.Yellow, $"保活任务启动：每 {keepAliveSeconds} 秒强制重连一次。");
+try
+{
+    await KeepAliveWorker(teleagent, desk, instance, keepAliveSeconds, globalCts.Token);
 }
 catch (OperationCanceledException)
 {
     Utility.WriteLine(ConsoleColor.Yellow, "程序已停止。");
 }
 
-async Task RunAccountAsync(AccountConfig account, RuntimeConfig runtimeConfig, CancellationToken ct)
+async Task KeepAliveWorker(TeleagentApi teleagent, DeskApi desk, InstanceInfo instance, int keepAliveSeconds, CancellationToken globalToken)
 {
-    var label = AccountLabel(account);
-    var api = new CtYunApi(account.DeviceCode);
-
-    Utility.WriteLine(ConsoleColor.Cyan, $"[{label}] 开始登录。");
-    if (!await PerformLoginSequence(api, account, runtimeConfig, ct))
-    {
-        Utility.WriteLine(ConsoleColor.Red, $"[{label}] 登录失败，跳过该账号。");
-        return;
-    }
-
-    var desktopList = await api.GetLlientListAsync();
-    if (desktopList == null || desktopList.Count == 0)
-    {
-        Utility.WriteLine(ConsoleColor.Yellow, $"[{label}] 未获取到云电脑。");
-        return;
-    }
-
-    var activeDesktops = new List<Desktop>();
-    foreach (var desktop in desktopList)
-    {
-        if (desktop.UseStatusText != "运行中")
-        {
-            Utility.WriteLine(ConsoleColor.Red, $"[{label}][{desktop.DesktopCode}] [{desktop.UseStatusText}] 电脑未开机，正在开机，请在2分钟后重新运行软件。");
-        }
-
-        var connectResult = await api.ConnectAsync(desktop.DesktopId);
-        if (connectResult.Success && connectResult.Data?.DesktopInfo != null)
-        {
-            desktop.DesktopInfo = connectResult.Data.DesktopInfo;
-            activeDesktops.Add(desktop);
-        }
-        else
-        {
-            Utility.WriteLine(ConsoleColor.Red, $"[{label}] Connect Error: [{desktop.DesktopId}] {connectResult.Msg}");
-        }
-    }
-
-    if (activeDesktops.Count == 0)
-    {
-        Utility.WriteLine(ConsoleColor.Yellow, $"[{label}] 没有可保活的云电脑。");
-        return;
-    }
-
-    Utility.WriteLine(ConsoleColor.Yellow, $"[{label}] 保活任务启动：每 {runtimeConfig.KeepAliveSeconds} 秒强制重连一次。");
-    var keepAliveTasks = activeDesktops.Select(d => KeepAliveWorkerWithForcedReset(api, account, d, runtimeConfig.KeepAliveSeconds, ct));
-    await Task.WhenAll(keepAliveTasks);
-}
-
-async Task<bool> PerformLoginSequence(CtYunApi api, AccountConfig account, RuntimeConfig runtimeConfig, CancellationToken ct)
-{
-    if (!await api.LoginAsync(account.User, account.Password))
-    {
-        return false;
-    }
-
-    if (api.LoginInfo.BondedDevice)
-    {
-        return true;
-    }
-
-    var label = AccountLabel(account);
-    Utility.WriteLine(ConsoleColor.Yellow, $"[{label}] 当前设备未绑定，正在发送短信验证码。");
-    if (!await api.GetSmsCodeAsync(account.User))
-    {
-        return false;
-    }
-
-    var verificationCode = ReadVerificationCode(account);
-    if (string.IsNullOrWhiteSpace(verificationCode))
-    {
-        Utility.WriteLine(ConsoleColor.Red, $"[{label}] 未获取到短信验证码。");
-        return false;
-    }
-
-    return await api.BindingDeviceAsync(verificationCode.Trim());
-}
-
-string ReadVerificationCode(AccountConfig account)
-{
-    var label = AccountLabel(account);
-    if (!CanReadFromConsole())
-    {
-        Utility.WriteLine(ConsoleColor.Red, $"[{label}] 当前账号需要短信验证码，请使用 -it 交互模式重新运行并输入验证码。");
-        return "";
-    }
-
-    Console.Write($"[{label}] 短信验证码: ");
-    return Console.ReadLine();
-}
-
-async Task KeepAliveWorkerWithForcedReset(CtYunApi api, AccountConfig account, Desktop desktop, int keepAliveSeconds, CancellationToken globalToken)
-{
-    var label = AccountLabel(account);
     var initialPayload = Convert.FromBase64String("UkVEUQIAAAACAAAAGgAAAAAAAAABAAEAAAABAAAAEgAAAAkAAAAECAAA");
-    var uri = new Uri($"wss://{desktop.DesktopInfo.ClinkLvsOutHost}/clinkProxy/{desktop.DesktopId}/MAIN");
 
     while (!globalToken.IsCancellationRequested)
     {
@@ -143,20 +104,26 @@ async Task KeepAliveWorkerWithForcedReset(CtYunApi api, AccountConfig account, D
 
         try
         {
-            Utility.WriteLine(ConsoleColor.Cyan, $"[{label}][{desktop.DesktopCode}] === 新周期开始，尝试连接 ===");
+            Utility.WriteLine(ConsoleColor.Cyan, $"[{instance.Id}] === 新周期开始，换取连接信息 ===");
+            var connectToken = await teleagent.ConnectAsync(instance.Id, globalToken);
+            var info = await desk.GetConnectDataByTokenAsync(connectToken, instance.Uid, globalToken);
+            await desk.GetDesktopStateAsync(info.DesktopId, globalToken);
+            Utility.WriteLine(ConsoleColor.Cyan, $"[{instance.Id}] 桌面 {info.DesktopId}，网关 {info.DesktopInfo.ClinkLvsOutHost}");
+
+            var uri = new Uri($"wss://{info.DesktopInfo.ClinkLvsOutHost}/clinkProxy/{info.DesktopId}/MAIN");
             await client.ConnectAsync(uri, sessionCts.Token);
 
-            var hostParts = desktop.DesktopInfo.ClinkLvsOutHost.Split(':', 2);
+            var hostParts = info.DesktopInfo.ClinkLvsOutHost.Split(':', 2);
             var connectMessage = new ConnecMessage
             {
                 type = 1,
                 ssl = 1,
                 host = hostParts[0],
                 port = hostParts.Length > 1 ? hostParts[1] : "443",
-                ca = desktop.DesktopInfo.CaCert,
-                cert = desktop.DesktopInfo.ClientCert,
-                key = desktop.DesktopInfo.ClientKey,
-                servername = desktop.DesktopInfo.Host + ":" + desktop.DesktopInfo.Port,
+                ca = info.DesktopInfo.CaCert,
+                cert = info.DesktopInfo.ClientCert,
+                key = info.DesktopInfo.ClientKey,
+                servername = info.DesktopInfo.Host + ":" + info.DesktopInfo.Port,
                 oqs = 0
             };
 
@@ -166,37 +133,46 @@ async Task KeepAliveWorkerWithForcedReset(CtYunApi api, AccountConfig account, D
             await Task.Delay(500, sessionCts.Token);
             await client.SendAsync(initialPayload, WebSocketMessageType.Binary, true, sessionCts.Token);
 
-            Utility.WriteLine(ConsoleColor.Green, $"[{label}][{desktop.DesktopCode}] 连接已就绪，保持 {keepAliveSeconds} 秒...");
+            Utility.WriteLine(ConsoleColor.Green, $"[{instance.Id}] 连接已就绪，保持 {keepAliveSeconds} 秒...");
 
             try
             {
-                await ReceiveLoop(api, client, account, desktop, sessionCts.Token);
+                await ReceiveLoop(client, info, sessionCts.Token);
             }
             catch (OperationCanceledException)
             {
-                Utility.WriteLine(ConsoleColor.Yellow, $"[{label}][{desktop.DesktopCode}] 周期时间到，准备重连...");
+                Utility.WriteLine(ConsoleColor.Yellow, $"[{instance.Id}] 周期时间到，准备重连...");
             }
+        }
+        catch (TeleagentAuthException ex)
+        {
+            Utility.WriteLine(ConsoleColor.Red, ex.Message);
+            Utility.WriteLine(ConsoleColor.Red, "operationToken 已失效，请重新登录 Teleagent 后更新配置。程序退出。");
+            return;
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
-            Utility.WriteLine(ConsoleColor.Red, $"[{label}][{desktop.DesktopCode}] 异常: {ex.Message}");
+            Utility.WriteLine(ConsoleColor.Red, $"[{instance.Id}] 异常: {ex.Message}");
             await Task.Delay(5000, globalToken);
         }
         finally
         {
             if (client.State == WebSocketState.Open)
             {
-                await client.CloseOutputAsync(WebSocketCloseStatus.NormalClosure, "Timeout Reset", CancellationToken.None);
+                try
+                {
+                    await client.CloseOutputAsync(WebSocketCloseStatus.NormalClosure, "Timeout Reset", CancellationToken.None);
+                }
+                catch { }
             }
         }
     }
 }
 
-async Task ReceiveLoop(CtYunApi api, ClientWebSocket ws, AccountConfig account, Desktop desktop, CancellationToken ct)
+async Task ReceiveLoop(ClientWebSocket ws, ConnectionInfo info, CancellationToken ct)
 {
     var buffer = new byte[8192];
     var encryptor = new Encryption();
-    var label = AccountLabel(account);
 
     while (ws.State == WebSocketState.Open && !ct.IsCancellationRequested)
     {
@@ -212,21 +188,22 @@ async Task ReceiveLoop(CtYunApi api, ClientWebSocket ws, AccountConfig account, 
         var hex = BitConverter.ToString(data).Replace("-", "");
         if (hex.StartsWith("52454451", StringComparison.OrdinalIgnoreCase))
         {
-            Utility.WriteLine(ConsoleColor.Green, $"[{label}][{desktop.DesktopCode}] -> 收到保活校验");
+            Utility.WriteLine(ConsoleColor.Green, "-> 收到保活校验");
             var response = encryptor.Execute(data);
             await ws.SendAsync(response, WebSocketMessageType.Binary, true, ct);
-            Utility.WriteLine(ConsoleColor.DarkGreen, $"[{label}][{desktop.DesktopCode}] -> 发送保活响应成功");
+            Utility.WriteLine(ConsoleColor.DarkGreen, "-> 发送保活响应成功");
             continue;
         }
 
         try
         {
             var infos = SendInfo.FromBuffer(data);
-            foreach (var info in infos)
+            foreach (var item in infos)
             {
-                if (info.Type == 103)
+                if (item.Type == 103)
                 {
-                    var payload = Encoding.UTF8.GetBytes("{\"type\":1,\"userName\":\"" + api.LoginInfo.UserName + "\",\"userInfo\":\"\",\"userId\":" + api.LoginInfo.UserId + "}");
+                    var userIdJson = long.TryParse(info.UserId, out var uidNum) ? uidNum.ToString() : "\"" + EscapeJson(info.UserId ?? "") + "\"";
+                    var payload = Encoding.UTF8.GetBytes("{\"type\":1,\"userName\":\"" + EscapeJson(info.UserName ?? "") + "\",\"userInfo\":\"\",\"userId\":" + userIdJson + "}");
                     var byUserName = new SendInfo { Type = 118, Data = payload }.ToBuffer(true);
                     await ws.SendAsync(byUserName, WebSocketMessageType.Binary, true, ct);
                 }
@@ -234,134 +211,73 @@ async Task ReceiveLoop(CtYunApi api, ClientWebSocket ws, AccountConfig account, 
         }
         catch (Exception ex)
         {
-            Utility.WriteLine(ConsoleColor.DarkYellow, $"[{label}][{desktop.DesktopCode}] 消息解析失败: {ex.Message}");
+            Utility.WriteLine(ConsoleColor.DarkYellow, $"消息解析失败: {ex.Message}");
         }
     }
 }
 
-RuntimeConfig LoadRuntimeConfig()
+TeleagentConfig LoadConfig()
 {
     var dataDir = GetDataDir();
     Directory.CreateDirectory(dataDir);
 
-    var config = LoadAccountsFromFile(dataDir) ?? LoadAccountsFromEnvironment();
-    if (config == null || config.Accounts.Count == 0)
-    {
-        config = LoadAccountsFromConsole(dataDir);
-    }
-
-    foreach (var account in config.Accounts)
-    {
-        account.Name = FirstNotEmpty(account.Name, account.User);
-        account.DeviceCode = ResolveDeviceCode(account, dataDir);
-    }
-
-    return new RuntimeConfig(config.Accounts, Math.Max(10, config.KeepAliveSeconds), dataDir);
-}
-
-AppConfig LoadAccountsFromEnvironment()
-{
-    var user = Environment.GetEnvironmentVariable("APP_USER");
-    var password = Environment.GetEnvironmentVariable("APP_PASSWORD");
-    if (string.IsNullOrWhiteSpace(user) || string.IsNullOrWhiteSpace(password))
-    {
-        return null;
-    }
-
-    return new AppConfig
-    {
-        Accounts =
-        [
-            new AccountConfig
-            {
-                Name = Environment.GetEnvironmentVariable("APP_NAME"),
-                User = user,
-                Password = password,
-                DeviceCode = Environment.GetEnvironmentVariable("DEVICECODE")
-            }
-        ]
-    };
-}
-
-AppConfig LoadAccountsFromFile(string dataDir)
-{
-    var configPath = Environment.GetEnvironmentVariable("CTYUN_CONFIG");
+    TeleagentConfig config = null;
+    var configPath = Environment.GetEnvironmentVariable("TELEAGENT_CONFIG");
     if (string.IsNullOrWhiteSpace(configPath))
     {
-        configPath = Path.Combine(dataDir, "accounts.json");
+        configPath = Path.Combine(dataDir, "config.json");
     }
 
-    if (!File.Exists(configPath))
+    if (File.Exists(configPath))
     {
-        return null;
-    }
-
-    try
-    {
-        var json = File.ReadAllText(configPath);
-        var config = JsonSerializer.Deserialize(json, AppJsonSerializerContext.Default.AppConfig);
-        Utility.WriteLine(ConsoleColor.Green, $"已读取配置文件：{configPath}");
-        return config;
-    }
-    catch (Exception ex)
-    {
-        Utility.WriteLine(ConsoleColor.Red, $"读取配置文件失败：{ex.Message}");
-        return null;
-    }
-}
-
-AppConfig LoadAccountsFromConsole(string dataDir)
-{
-    if (!CanReadFromConsole())
-    {
-        return new AppConfig();
-    }
-
-    var accounts = new List<AccountConfig>();
-    while (true)
-    {
-        Console.Write("账号: ");
-        var user = Console.ReadLine();
-        if (string.IsNullOrWhiteSpace(user))
+        try
         {
-            break;
+            var json = File.ReadAllText(configPath);
+            config = JsonSerializer.Deserialize(json, AppJsonSerializerContext.Default.TeleagentConfig);
+            Utility.WriteLine(ConsoleColor.Green, $"已读取配置文件：{configPath}");
         }
-
-        Console.Write("密码: ");
-        var password = ReadPassword();
-        accounts.Add(new AccountConfig { Name = user, User = user, Password = password });
-
-        Console.Write("继续添加账号? (y/N): ");
-        var answer = Console.ReadLine();
-        if (!string.Equals(answer, "y", StringComparison.OrdinalIgnoreCase))
+        catch (Exception ex)
         {
-            break;
+            Utility.WriteLine(ConsoleColor.Red, $"读取配置文件失败：{ex.Message}");
         }
     }
 
-    if (accounts.Count > 0)
+    config ??= new TeleagentConfig();
+
+    var envToken = Environment.GetEnvironmentVariable("TELEAGENT_OPERATION_TOKEN");
+    if (!string.IsNullOrWhiteSpace(envToken))
     {
-        Utility.WriteLine(ConsoleColor.Yellow, $"交互输入模式已读取 {accounts.Count} 个账号。设备码会保存到 {Path.Combine(dataDir, "devices")}。");
+        config.OperationToken = envToken;
+    }
+    var envInstance = Environment.GetEnvironmentVariable("TELEAGENT_INSTANCE_ID");
+    if (!string.IsNullOrWhiteSpace(envInstance))
+    {
+        config.InstanceId = envInstance;
+    }
+    if (int.TryParse(Environment.GetEnvironmentVariable("TELEAGENT_KEEP_ALIVE_SECONDS"), out var envKeepAlive))
+    {
+        config.KeepAliveSeconds = envKeepAlive;
     }
 
-    return new AppConfig { Accounts = accounts };
+    if (string.IsNullOrWhiteSpace(config.OperationToken) && CanReadFromConsole())
+    {
+        Console.Write("operationToken: ");
+        config.OperationToken = Console.ReadLine()?.Trim();
+    }
+
+    return config;
 }
 
-string ResolveDeviceCode(AccountConfig account, string dataDir)
+string ResolveDeviceCode()
 {
-    if (!string.IsNullOrWhiteSpace(account.DeviceCode))
-    {
-        return account.DeviceCode.Trim();
-    }
-
+    var dataDir = GetDataDir();
     var devicesDir = Path.Combine(dataDir, "devices");
     Directory.CreateDirectory(devicesDir);
-    var deviceCodePath = Path.Combine(devicesDir, SafeName(account.Name ?? account.User) + ".txt");
+    var deviceCodePath = Path.Combine(devicesDir, "teleagent.txt");
     if (!File.Exists(deviceCodePath))
     {
         File.WriteAllText(deviceCodePath, "web_" + GenerateRandomString(32));
     }
-
     return File.ReadAllText(deviceCodePath).Trim();
 }
 
@@ -372,7 +288,6 @@ string GetDataDir()
     {
         return dataDir;
     }
-
     return IsRunningInContainer() ? "/app/data" : AppContext.BaseDirectory;
 }
 
@@ -382,51 +297,8 @@ static string GenerateRandomString(int length)
     return new string(Enumerable.Repeat(chars, length).Select(s => s[RandomNumberGenerator.GetInt32(s.Length)]).ToArray());
 }
 
-static string ReadPassword()
-{
-    var sb = new StringBuilder();
-    while (true)
-    {
-        var key = Console.ReadKey(true);
-        if (key.Key == ConsoleKey.Enter)
-        {
-            Console.WriteLine();
-            return sb.ToString();
-        }
-
-        if (key.Key == ConsoleKey.Backspace && sb.Length > 0)
-        {
-            sb.Remove(sb.Length - 1, 1);
-            Console.Write("\b \b");
-        }
-        else if (!char.IsControl(key.KeyChar))
-        {
-            sb.Append(key.KeyChar);
-            Console.Write("*");
-        }
-    }
-}
-
-static string AccountLabel(AccountConfig account) => account.Name ?? account.User;
-
-static string SafeName(string value)
-{
-    var source = string.IsNullOrWhiteSpace(value) ? "default" : value;
-    var builder = new StringBuilder(source.Length);
-    foreach (var ch in source)
-    {
-        builder.Append(char.IsLetterOrDigit(ch) ? ch : '_');
-    }
-    return builder.ToString();
-}
-
-static string FirstNotEmpty(params string[] values) => values.FirstOrDefault(v => !string.IsNullOrWhiteSpace(v));
+static string EscapeJson(string value) => value.Replace("\\", "\\\\").Replace("\"", "\\\"");
 
 static bool CanReadFromConsole() => !Console.IsInputRedirected && !Console.IsOutputRedirected;
 
 static bool IsRunningInContainer() => File.Exists("/.dockerenv");
-
-record RuntimeConfig(
-    List<AccountConfig> Accounts,
-    int KeepAliveSeconds,
-    string DataDir);
